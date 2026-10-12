@@ -1,0 +1,56 @@
+{
+  "continuous": {
+    "method": "exact: CC-MAD MILP (PuLP + HiGHS Branch & Bound)",
+    "status": "feasible (time limit)",
+    "mad": 0.010071259388123,
+    "best_bound": 0.0092070782880894,
+    "gap": 0.0858066570157756,
+    "solve_time_s": 1800.212,
+    "weights": {
+      "CLX": 0.277098,
+      "RE": 0.261186,
+      "AZO": 0.225658,
+      "FB": 0.132536,
+      "HUM": 0.103523
+    },
+    "shares": null,
+    "out_of_sample": {
+      "final_value": 11429.32586,
+      "total_return": 0.142933,
+      "annual_return": 0.129234,
+      "annual_volatility": 0.104968,
+      "sharpe_ratio": 1.231177,
+      "max_drawdown": -0.069184
+    }
+  },
+  "integer_shares": {
+    "method": "exact: CC-MAD MILP (PuLP + HiGHS Branch & Bound)",
+    "status": "feasible (time limit)",
+    "mad": 0.0100515999080987,
+    "best_bound": 0.0092764840723498,
+    "gap": 0.0771136777066071,
+    "solve_time_s": 1800.374,
+    "weights": {
+      "CLX": 0.276046,
+      "RE": 0.23804,
+      "AZO": 0.236937,
+      "FB": 0.13806,
+      "HUM": 0.102015
+    },
+    "shares": {
+      "CLX": 23,
+      "RE": 11,
+      "AZO": 3,
+      "FB": 12,
+      "HUM": 5
+    },
+    "out_of_sample": {
+      "final_value": 11414.23,
+      "total_return": 0.141423,
+      "annual_return": 0.127877,
+      "annual_volatility": 0.103599,
+      "sharpe_ratio": 1.234349,
+      "max_drawdown": -0.069278
+    }
+  }
+}
