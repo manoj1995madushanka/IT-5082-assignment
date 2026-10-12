@@ -1,0 +1,1302 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # 01 · Data Exploration and Cleaning
+# 
+# **Problem (Option C – The Smart Investor):** invest **$10,000** in **at most 5** of the ~500 S&P 500 companies so that the portfolio reaches a required expected return with the **minimum risk**.
+# 
+# In this assignment the data is **not used to train a model**. It *instantiates* the optimisation model:
+# 
+# | Model parameter | Derived from the data |
+# |---|---|
+# | $r_{ti}$ – return of stock $i$ in week $t$ | weekly close-to-close returns, 2013-02 → 2016-12 (estimation window) |
+# | $\mu_i$ – expected return | mean of $r_{ti}$ over the estimation window |
+# | $p_i$ – share price on the decision date | close on 2016-12-30 (for whole-share purchases) |
+# | out-of-sample validation | daily prices 2017-01 → 2018-02 |
+# 
+# **Dataset:** [S&P 500 stock data – Kaggle `camnugent/sandp500`](https://www.kaggle.com/datasets/camnugent/sandp500) (licence CC0: Public Domain). Daily open/high/low/close/volume for all companies in the S&P 500 index between 2013-02-08 and 2018-02-07.
+# 
+# **Contents**
+# 1. Setup and parameters
+# 2. Raw data and quality checks
+# 3. Cleaning: incomplete histories and unadjusted corporate actions
+# 4. Weekly returns and the train / test split
+# 5. Exploratory analysis (risk vs return, fat tails, correlations, prices)
+# 6. Export of the cleaned data used by notebook 02 (and by the heuristic)
+
+# ## 1. Setup and parameters
+
+# In[1]:
+
+
+from pathlib import Path
+import shutil
+
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+pd.set_option("display.float_format", "{:.4f}".format)
+
+
+# All folders are relative to the repository root, so the notebook works on any machine.
+# The two thresholds define what counts as an *implausible* one-day move for an S&P 500 stock (explained in section 3).
+
+# In[2]:
+
+
+ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+RAW_FILE = ROOT / "data" / "raw" / "all_stocks_5yr.csv"
+PROCESSED_DIR = ROOT / "data" / "processed"
+FIGURES_DIR = ROOT / "results" / "figures"
+
+TRAIN_END = "2016-12-31"      # estimation window: 2013-02 .. 2016-12
+TEST_START = "2017-01-01"     # out-of-sample window: 2017-01 .. 2018-02
+TARGET_ANNUAL_RETURN = 0.20   # investor's required return (used here only for context)
+BUDGET, MIN_WEIGHT = 10_000, 0.05
+MAX_DAILY_DROP, MAX_DAILY_RISE = -0.30, 0.40   # outside this band = split / spin-off / bad tick
+
+
+# **Figure style.** One consistent look for every report figure: a colour-blind-safe palette (blue, orange, green), light grid, no top/right borders. `save()` writes each figure to `results/figures/` for the PDF report.
+
+# In[3]:
+
+
+BLUE, ORANGE, GREEN, MUTED, GRID = "#2a78d6", "#eb6834", "#1baf7a", "#52514e", "#e4e3df"
+mpl.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 200, "savefig.bbox": "tight",
+    "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": GRID,
+    "axes.grid": True, "axes.axisbelow": True, "grid.color": GRID,
+    "axes.titlelocation": "left", "axes.titleweight": "semibold", "axes.titlesize": 12,
+    "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED,
+    "axes.prop_cycle": mpl.cycler(color=[BLUE, ORANGE, GREEN]),
+    "legend.frameon": False, "lines.linewidth": 2,
+})
+
+def save(fig, name):
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(FIGURES_DIR / f"{name}.png")
+
+
+# ## 2. Raw data and quality checks
+# The CSV is committed in `data/raw/`. If it is missing, it is downloaded from Kaggle with `kagglehub`, which works for public datasets without an API token.
+
+# In[4]:
+
+
+if not RAW_FILE.exists():
+    import kagglehub
+    src = kagglehub.dataset_download("camnugent/sandp500")
+    RAW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(Path(src) / "all_stocks_5yr.csv", RAW_FILE)
+
+raw = pd.read_csv(RAW_FILE, parse_dates=["date"])
+print(raw.shape)
+raw.head()
+
+
+# In[5]:
+
+
+pd.Series({
+    "rows": len(raw),
+    "tickers": raw["Name"].nunique(),
+    "first date": raw["date"].min().date(),
+    "last date": raw["date"].max().date(),
+    "trading days": raw["date"].nunique(),
+    "duplicate (date, ticker) rows": raw.duplicated(["date", "Name"]).sum(),
+    "non-positive close prices": (raw["close"] <= 0).sum(),
+}).to_frame("value")
+
+
+# In[6]:
+
+
+raw.isna().sum().to_frame("missing values")
+
+
+# Only 11 `open` values are missing. The model uses **closing prices only**, and those are complete.
+# 
+# We reshape the long table (one row per day *and* ticker) into a wide **price matrix**: one row per trading day, one column per ticker.
+
+# In[7]:
+
+
+prices_all = raw.pivot(index="date", columns="Name", values="close").sort_index()
+prices_all.iloc[:5, :8]
+
+
+# ## 3. Cleaning
+# ### 3.1 Incomplete histories
+# Companies that joined the index (or listed) after Feb 2013 have fewer than 1,259 observations. The MAD risk model compares all stocks over the *same* weeks, so these are excluded.
+
+# In[8]:
+
+
+complete = prices_all.notna().all()
+short_history = sorted(prices_all.columns[~complete])
+print(f"{len(short_history)} tickers with an incomplete history")
+prices_all.notna().sum()[short_history].sort_values().head(10).to_frame("trading days available")
+
+
+# ### 3.2 Unadjusted stock splits and spin-offs ⚠️
+# The prices in this dataset are **not adjusted** for corporate actions. A 2-for-1 split appears as a −50% "return" that no investor actually suffered. Left in the data, these fake crashes would make the affected stocks look extremely risky and distort the optimiser.
+# 
+# We flag every daily move below −30% or above +40%:
+
+# In[9]:
+
+
+prices = prices_all.loc[:, complete]
+daily = prices.pct_change().iloc[1:]
+jumps = daily[(daily < MAX_DAILY_DROP) | (daily > MAX_DAILY_RISE)].stack().reset_index()
+jumps.columns = ["date", "ticker", "daily_return"]
+jumps.sort_values("daily_return")
+
+
+# In[10]:
+
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.2))
+for ax, (ticker, label) in zip(axes, [("EBAY", "eBay – PayPal spin-off (Jul 2015)"),
+                                      ("DISCA", "Discovery – 2:1 split (Aug 2014)"),
+                                      ("LNT", "Alliant Energy – one-day bad tick (May 2016)")]):
+    prices_all[ticker].plot(ax=ax, color=BLUE, lw=1.5)
+    ax.set_title(label, fontsize=10)
+    ax.set_xlabel("")
+    ax.set_ylabel("close price ($)")
+fig.suptitle("Unadjusted corporate actions look like crashes", x=0.01, ha="left", fontweight="semibold")
+fig.tight_layout()
+save(fig, "01_unadjusted_corporate_actions")
+
+
+# These drops are share-count changes (splits, spin-offs) or data errors: the LNT price halves for one day and recovers the next. None of them is an economic loss. We cannot reliably reconstruct adjustment factors from this dataset alone, so the **13 affected tickers are removed** (2.8% of the universe). This is conservative and keeps the remaining return estimates trustworthy.
+
+# In[11]:
+
+
+dropped_for_jumps = sorted(jumps["ticker"].unique())
+prices = prices.drop(columns=dropped_for_jumps)
+
+print(f"raw tickers                          : {prices_all.shape[1]}")
+print(f"dropped – incomplete history         : {len(short_history)}")
+print(f"dropped – split / spin-off / bad tick: {len(dropped_for_jumps)} {dropped_for_jumps}")
+print(f"clean universe                       : {prices.shape[1]}")
+
+# sanity checks: no gaps and no implausible moves remain
+assert prices.notna().all().all()
+remaining = prices.pct_change().iloc[1:]
+assert remaining.min().min() >= MAX_DAILY_DROP and remaining.max().max() <= MAX_DAILY_RISE
+
+
+# ## 4. Weekly returns and the train / test split
+# **Why weekly returns?**
+# * Daily returns are noisy and affected by non-synchronous trading.
+# * Monthly returns would leave only ~47 observations for 457 stocks.
+# * Weekly data gives $T = 203$ scenarios in the estimation window. $T$ also sets the number of MAD constraints in the model ($2T$).
+# 
+# The return of week $t$ is $r_{ti} = P_{i,t} / P_{i,t-1} - 1$, using Friday closing prices.
+
+# In[12]:
+
+
+weekly = prices.resample("W-FRI").last().pct_change().iloc[1:]
+train, test = weekly.loc[:TRAIN_END], weekly.loc[TEST_START:]
+
+print(f"weekly returns: {weekly.shape[0]} weeks x {weekly.shape[1]} stocks")
+print(f"estimation (train): {train.index.min().date()} → {train.index.max().date()}  ({len(train)} weeks)")
+print(f"out-of-sample (test): {test.index.min().date()} → {test.index.max().date()}  ({len(test)} weeks)")
+
+
+# ## 5. Exploratory analysis
+# ### 5.1 Risk and return of each stock (estimation window)
+
+# In[13]:
+
+
+stats = pd.DataFrame({
+    "annual_return": train.mean() * 52,
+    "annual_volatility": train.std() * np.sqrt(52),
+    "weekly_MAD": (train - train.mean()).abs().mean(),
+    "excess_kurtosis": train.kurt(),
+})
+stats["return_per_risk"] = stats["annual_return"] / stats["annual_volatility"]
+stats.describe().T
+
+
+# In[14]:
+
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.scatter(stats["annual_volatility"], stats["annual_return"], s=14, color=BLUE, alpha=0.55,
+           edgecolor="white", linewidth=0.4)
+ax.axhline(TARGET_ANNUAL_RETURN, color=ORANGE, lw=1.5, ls="--")
+ax.text(stats["annual_volatility"].max(), TARGET_ANNUAL_RETURN + 0.01,
+        f"required return {TARGET_ANNUAL_RETURN:.0%}", ha="right", color=MUTED, fontsize=9)
+for t in stats["return_per_risk"].nlargest(2).index.union(stats["annual_return"].nlargest(3).index):
+    ax.annotate(t, (stats.loc[t, "annual_volatility"], stats.loc[t, "annual_return"]),
+                xytext=(4, 2), textcoords="offset points", fontsize=8, color=MUTED)
+ax.set_xlabel("annual volatility (train)")
+ax.set_ylabel("mean annual return (train)")
+ax.xaxis.set_major_formatter(PercentFormatter(1))
+ax.yaxis.set_major_formatter(PercentFormatter(1))
+ax.set_title(f"Risk vs return of the {len(stats)} candidate stocks, 2013–2016")
+save(fig, "01_risk_return_universe")
+
+n_above = (stats["annual_return"] >= TARGET_ANNUAL_RETURN).sum()
+print(f"{n_above} of {len(stats)} stocks individually reach the {TARGET_ANNUAL_RETURN:.0%} target")
+
+
+# Only a minority of stocks reach the 20% target on their own, and those tend to be the more volatile ones. The optimiser has to combine high-return stocks with stocks that **move differently**, so that their deviations partly cancel. That interaction is what makes the selection hard.
+# 
+# ### 5.2 Why Mean Absolute Deviation instead of variance?
+# Weekly stock returns are **fat-tailed** (positive excess kurtosis). Variance squares deviations, so a few extreme weeks dominate it. MAD weights deviations linearly, which makes it more robust to outliers. Its key advantage for this assignment is that it can be written with **linear** constraints, so the cardinality-constrained problem stays an MILP that PuLP can solve exactly (Konno & Yamazaki, 1991).
+
+# In[15]:
+
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.hist(stats["excess_kurtosis"].clip(upper=20), bins=50, color=BLUE, edgecolor="white", linewidth=0.5)
+ax.axvline(0, color=ORANGE, lw=1.5, ls="--")
+ax.text(0.3, ax.get_ylim()[1] * 0.9, "normal distribution = 0", color=MUTED, fontsize=9)
+ax.set_xlabel("excess kurtosis of weekly returns (clipped at 20)")
+ax.set_ylabel("number of stocks")
+ax.set_title("Weekly returns are fat-tailed")
+save(fig, "01_kurtosis")
+print(f"median excess kurtosis: {stats['excess_kurtosis'].median():.2f}; "
+      f"{(stats['excess_kurtosis'] > 0).mean():.0%} of stocks are fat-tailed")
+
+
+# ### 5.3 Correlation structure
+
+# In[16]:
+
+
+corr = train.corr()
+upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1)).stack()
+print(upper.describe())
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.hist(upper, bins=80, color=BLUE, edgecolor="white", linewidth=0.3)
+ax.set_xlabel("pairwise correlation of weekly returns")
+ax.set_ylabel("number of stock pairs")
+ax.set_title(f"{len(upper):,} stock pairs: mostly weak positive correlation")
+save(fig, "01_correlations")
+
+
+# In[17]:
+
+
+pd.concat([upper.nlargest(5), upper.nsmallest(5)]).to_frame("correlation")
+
+
+# The most similar stocks are **utilities in the same regulated sector** (CMS, DTE, XEL, WEC, ρ ≈ 0.90): holding several of them adds almost no diversification. The few negative correlations pair a defensive utility (ED) with financial stocks (SCHW, LNC, RF, ETFC). These offsetting movements are exactly what a minimum-risk portfolio exploits.
+
+# ### 5.4 Share prices on the decision date
+# The whole-share version of the model buys **whole shares** at the 2016-12-30 close. With $10,000 and a 5% minimum position ($500), very expensive stocks could be hard to fit:
+
+# In[18]:
+
+
+p0 = prices.loc[:TRAIN_END].iloc[-1]
+print(p0.describe())
+print("\nmost expensive stocks:")
+print(p0.nlargest(6).round(2).to_string())
+
+
+# Even the most expensive stock (PCLN ≈ $1,466) fits inside a $500–$4,000 position (5%–40% of $10,000). Rounding to whole shares therefore changes the weights only slightly.
+# 
+# ## 6. Export the cleaned data
+# Notebook 02 (exact method) and the heuristic notebook read **exactly these files**, so both methods solve the identical problem instance:
+# 
+# | File | Content |
+# |---|---|
+# | `weekly_returns_train.csv` | 203 weeks × 457 stocks – builds the model |
+# | `weekly_returns_test.csv` | 58 weeks × 457 stocks – out-of-sample |
+# | `daily_close_clean.csv` | daily closes – decision-date prices and the backtest |
+
+# In[19]:
+
+
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+train.to_csv(PROCESSED_DIR / "weekly_returns_train.csv")
+test.to_csv(PROCESSED_DIR / "weekly_returns_test.csv")
+prices.to_csv(PROCESSED_DIR / "daily_close_clean.csv")
+sorted(p.name for p in PROCESSED_DIR.iterdir())
+
+
+# ## Summary
+# * 505 tickers → **457 clean stocks** (35 incomplete histories and 13 unadjusted corporate actions removed).
+# * **203 weekly scenarios** for estimation (2013–2016) and **58 weeks (≈13 months)** for out-of-sample validation (2017-01 → 2018-02).
+# * Returns are fat-tailed and mostly positively correlated, which supports a robust, linear risk measure (MAD).
+# * Search space: choosing up to 5 of 457 stocks gives $\sum_{k=1}^{5}\binom{457}{k} \approx 1.6\times10^{11}$ subsets, each with a continuous weight problem. Enumerating them is infeasible, so we need Branch & Bound (notebook 02).
+#!/usr/bin/env python
+# coding: utf-8
+
+# # 02 · Exact Method: Cardinality-Constrained Portfolio Optimisation as a MILP
+# 
+# **Question:** which ≤ 5 of 457 S&P 500 stocks should we buy with $10,000, and how much of each, to reach a **20% expected annual return with the minimum risk**?
+# 
+# **Method:** a **Mixed-Integer Linear Program** (cardinality-constrained Mean-Absolute-Deviation model), solved to proven optimality, or to a certified gap, by **LP-based Branch & Bound** (HiGHS solver through PuLP; CBC as a cross-check).
+# 
+# **Contents**
+# 1. Setup and problem parameters
+# 2. Loading the problem instance (cleaned data from notebook 01)
+# 3. Mathematical formulation
+# 4. Implementation: building the MILP in PuLP
+# 5. Implementation: solving it and reading the solver's proof (bound and gap)
+# 6. A method-independent evaluator (shared with the heuristic)
+# 7. Worked example: LP relaxation vs Branch & Bound on 10 stocks
+# 8. Verification: is the "exact" answer really optimal?
+# 9. Experiments: full problem, scalability, solver comparison, efficient frontier, sensitivity to K
+# 10. Out-of-sample validation (2017–2018)
+# 11. Export for the comparison with the heuristic
+# 12. Discussion and future work
+# 
+# > **Running time.** The full experiments take about 2.5 hours (some solves run for 30 minutes). Their results are saved in `results/exact/`. With `RUN_EXPERIMENTS = False` (default), the notebook **loads** those saved results and runs in about a minute. Set it to `True` to recompute everything from scratch.
+
+# ## 1. Setup and problem parameters
+
+# In[1]:
+
+
+import itertools
+import json
+import math
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pulp
+from scipy.optimize import linprog
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+pd.set_option("display.float_format", "{:.5f}".format)
+print("PuLP", pulp.__version__, "| solvers available:", pulp.listSolvers(onlyAvailable=True))
+
+
+# **Investor parameters (Option C).** Every number the model uses is defined once here.
+# 
+# | Symbol | Value | Meaning |
+# |---|---|---|
+# | $B$ | \$10,000 | budget |
+# | $K$ | 5 | maximum number of stocks held (the investor can only follow 5 companies) |
+# | $l$ | 5% | minimum position size if a stock is bought (no meaningless 0.1% holdings) |
+# | $u$ | 40% | maximum position size (forces diversification: at least 3 stocks) |
+# | $\rho$ | 20% / 52 | required expected **weekly** return (20% per year) |
+# | cash | ≤ 1% | whole-share plans may leave at most $100 unspent |
+
+# In[2]:
+
+
+BUDGET = 10_000.0
+MAX_ASSETS = 5                 # K
+MIN_WEIGHT = 0.05              # l
+MAX_WEIGHT = 0.40              # u
+TARGET_ANNUAL_RETURN = 0.20    # rho * 52
+MAX_CASH = 0.01                # whole-share variant only
+PERIODS_PER_YEAR = 52          # weekly data
+
+RUN_EXPERIMENTS = False        # True = recompute all experiments (~2.5 h); False = load saved results
+TIME_LIMIT = 300               # seconds per solve in the experiments
+MAIN_TIME_LIMIT = 1800         # seconds for the headline full-size solve
+
+ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+PROCESSED_DIR = ROOT / "data" / "processed"
+RESULTS_DIR = ROOT / "results" / "exact"
+FIGURES_DIR = ROOT / "results" / "figures"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# In[3]:
+
+
+# Same figure style as notebook 01 (colour-blind-safe palette, light grid)
+BLUE, ORANGE, GREEN, MUTED, GRID = "#2a78d6", "#eb6834", "#1baf7a", "#52514e", "#e4e3df"
+mpl.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 200, "savefig.bbox": "tight",
+    "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": GRID,
+    "axes.grid": True, "axes.axisbelow": True, "grid.color": GRID,
+    "axes.titlelocation": "left", "axes.titleweight": "semibold", "axes.titlesize": 12,
+    "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED,
+    "axes.prop_cycle": mpl.cycler(color=[BLUE, ORANGE, GREEN]),
+    "legend.frameon": False, "lines.linewidth": 2,
+})
+
+def save(fig, name):
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(FIGURES_DIR / f"{name}.png")
+
+
+# ## 2. Loading the problem instance
+# Notebook 01 cleaned the Kaggle data and saved it to `data/processed/`. Here we read:
+# * `weekly_returns_train.csv`: the matrix $r_{ti}$ (203 weeks × 457 stocks) that defines the model;
+# * `daily_close_clean.csv`: daily prices, used for the decision-date share prices $p_i$ and for the out-of-sample test.
+
+# In[4]:
+
+
+train = pd.read_csv(PROCESSED_DIR / "weekly_returns_train.csv", index_col=0, parse_dates=True)
+daily_prices = pd.read_csv(PROCESSED_DIR / "daily_close_clean.csv", index_col=0, parse_dates=True)
+decision_prices = daily_prices.loc[:"2016-12-31"].iloc[-1]     # close on 2016-12-30
+
+print(f"returns: {train.shape[0]} weeks x {train.shape[1]} stocks, "
+      f"{train.index.min().date()} → {train.index.max().date()}")
+print(f"decision date: {daily_prices.loc[:'2016-12-31'].index[-1].date()}")
+
+
+# **The `Instance` class** bundles everything that defines one problem: the return data, the prices, and the parameters $K, l, u, \rho$. Bundling them lets us create smaller or modified problems easily (random subsets for the scalability study, other values of $K$, other targets) with `replace(...)`.
+# 
+# It also computes the derived model parameters:
+# * `mu`: $\mu_i = \frac{1}{T}\sum_t r_{ti}$, the expected weekly return of each stock;
+# * `deviations`: $a_{ti} = r_{ti} - \mu_i$, how far each stock is from its mean in each week, which is the building block of MAD;
+# * `max_achievable_return`: the highest return any feasible portfolio can reach. Fill the best stocks up to $u$ each; greedy is optimal for this small LP. A target above this value is infeasible.
+
+# In[5]:
+
+
+@dataclass
+class Instance:
+    returns: pd.DataFrame                  # T x N weekly returns r_ti
+    prices: pd.Series                      # price p_i on the decision date
+    K: int = MAX_ASSETS
+    w_min: float = MIN_WEIGHT
+    w_max: float = MAX_WEIGHT
+    target: float = TARGET_ANNUAL_RETURN / PERIODS_PER_YEAR   # rho (weekly)
+    budget: float = BUDGET
+    max_cash: float = MAX_CASH
+
+    def __post_init__(self):
+        self.prices = self.prices.loc[self.returns.columns]    # keep prices aligned with stocks
+
+    @property
+    def tickers(self): return list(self.returns.columns)
+    @property
+    def N(self): return self.returns.shape[1]
+    @property
+    def T(self): return self.returns.shape[0]
+    @property
+    def mu(self): return self.returns.values.mean(axis=0)
+    @property
+    def deviations(self): return self.returns.values - self.mu
+
+    def max_achievable_return(self):
+        remaining, total = 1.0, 0.0
+        for m in np.sort(self.mu)[::-1][: self.K]:
+            w = min(self.w_max, remaining)
+            total, remaining = total + w * m, remaining - w
+            if remaining <= 1e-12:
+                return total
+        return -np.inf
+
+    def subset(self, tickers, **changes):
+        return replace(self, returns=self.returns[tickers], **changes)
+
+
+def random_subinstance(inst, n, seed):
+    """n randomly chosen stocks (reproducible via seed). A random subset may not contain
+    stocks good enough for the 20% target, so the target is capped at 90% of what the
+    subset can achieve - this keeps every sampled instance feasible."""
+    rng = np.random.default_rng(seed)
+    tickers = sorted(rng.choice(inst.tickers, size=n, replace=False))
+    target = min(inst.target, 0.9 * inst.subset(tickers).max_achievable_return())
+    return inst.subset(tickers, target=target)
+
+
+inst = Instance(returns=train, prices=decision_prices)
+print(f"N = {inst.N} stocks, T = {inst.T} weeks, K = {inst.K}, weights in [{inst.w_min:.0%}, {inst.w_max:.0%}], "
+      f"target = {inst.target * 52:.0%}/yr (max achievable {inst.max_achievable_return() * 52:.0%}/yr)")
+
+
+# ## 3. Mathematical formulation
+# 
+# **Sets and indices**
+# * $i \in \{1,\dots,N\}$: candidate stocks ($N = 457$)
+# * $t \in \{1,\dots,T\}$: weekly scenarios in the estimation window ($T = 203$)
+# 
+# **Parameters (from the data)**
+# * $r_{ti}$: return of stock $i$ in week $t$
+# * $\mu_i = \frac{1}{T}\sum_t r_{ti}$: expected weekly return of stock $i$
+# * $a_{ti} = r_{ti} - \mu_i$: deviation of stock $i$ from its mean in week $t$
+# * $\rho$: required expected return ($20\%/52$ per week); $K = 5$; $l = 0.05$; $u = 0.40$
+# 
+# **Decision variables**
+# * $w_i \in [0, u]$: fraction of the budget invested in stock $i$ (continuous)
+# * $z_i \in \{0, 1\}$: 1 if stock $i$ is bought (binary)
+# * $d_t \ge 0$: absolute deviation of the portfolio return in week $t$ (auxiliary)
+# 
+# **Model (CC-MAD)**
+# $$
+# \begin{aligned}
+# \min_{w,z,d}\quad & \frac{1}{T}\sum_{t=1}^{T} d_t && \text{(mean absolute deviation = risk)}\\
+# \text{s.t.}\quad & d_t \ \ge\ \ \ \sum_{i} a_{ti} w_i && \forall t \quad (1)\\
+# & d_t \ \ge\ -\sum_{i} a_{ti} w_i && \forall t \quad (2)\\
+# & \sum_{i} w_i = 1 && (3)\ \text{fully invested}\\
+# & \sum_{i} \mu_i w_i \ \ge\ \rho && (4)\ \text{return target}\\
+# & \sum_{i} z_i \ \le\ K && (5)\ \text{at most 5 stocks}\\
+# & l\, z_i \ \le\ w_i \ \le\ u\, z_i && \forall i \quad (6)\ \text{linking}\\
+# & z_i \in \{0,1\},\ w_i \ge 0,\ d_t \ge 0
+# \end{aligned}
+# $$
+# 
+# **How each part works**
+# * **Objective.** The risk is the average size of the portfolio's weekly deviation from its own mean: $\frac1T\sum_t |\sum_i a_{ti}w_i|$.
+# * **(1)–(2) linearise the absolute value.** $d_t$ must be at least $+x$ and at least $-x$, so $d_t \ge |x|$. Because we *minimise* $d_t$, at the optimum $d_t = |x|$ exactly. This trick keeps the model linear, so PuLP can solve it.
+# * **(3)** all money is invested. **(4)** the expected return meets the target.
+# * **(5)** is the **cardinality constraint**. Only (5), together with the binaries, makes the problem combinatorial; without it the model is a plain LP.
+# * **(6) is a Big-M linking constraint** (here $M = u$). If $z_i = 0$ then $w_i = 0$: a stock cannot receive money unless it is "picked". If $z_i = 1$ then $l \le w_i \le u$.
+# 
+# **Whole-share variant (realistic purchase plan).** Let $p_i$ be the price on the decision date, $B$ the budget and $x_i \in \mathbb{Z}_{\ge 0}$ the number of shares bought. Add $B\,w_i = p_i\,x_i$, and replace (3) by $1 - c \le \sum_i w_i \le 1$, where $c$ = 1% is the cash left over from rounding to whole shares.
+# 
+# **Why MAD and not variance (Markowitz)?** Variance makes the objective *quadratic* (an MIQP), and PuLP handles **linear** models only. MAD (Konno & Yamazaki, 1991) keeps the risk–return trade-off with linear constraints, and it is more robust to the fat-tailed returns found in notebook 01.
+# 
+# **Problem class.** With constraint (5) the problem is **NP-hard** (Bienstock, 1996; Moral-Escudero et al., 2006). It contains subset selection: choosing ≤ 5 of 457 stocks gives about $1.6 \times 10^{11}$ subsets, and each needs its weights optimised.
+
+# ## 4. Implementation: building the MILP in PuLP
+# `build_model` turns the formulation into a PuLP model **line by line**; the comments refer to the equation numbers above.
+# 
+# Two options are used later:
+# * `integer_shares=True` adds the whole-share variables $x_i$;
+# * `relax=True` makes $z_i$ (and $x_i$) continuous. This gives the **LP relaxation**, which is exactly what Branch & Bound solves at its first (root) node.
+
+# In[6]:
+
+
+def build_model(inst, integer_shares=False, relax=False):
+    N, T = inst.N, inst.T
+    a, mu = inst.deviations, inst.mu
+    binary = pulp.LpContinuous if relax else pulp.LpBinary
+    integer = pulp.LpContinuous if relax else pulp.LpInteger
+
+    m = pulp.LpProblem("CC_MAD_portfolio", pulp.LpMinimize)
+
+    # decision variables
+    w = [m.add_variable(f"w_{i}", lowBound=0, upBound=inst.w_max) for i in range(N)]       # weights
+    z = [m.add_variable(f"z_{i}", lowBound=0, upBound=1, cat=binary) for i in range(N)]    # pick stock i?
+    d = [m.add_variable(f"d_{t}", lowBound=0) for t in range(T)]                           # |deviation| in week t
+
+    # objective: mean absolute deviation
+    m += pulp.lpSum(d) * (1.0 / T), "MAD"
+
+    # (1)-(2): d_t >= |sum_i a_ti w_i|
+    for t in range(T):
+        port_dev = pulp.LpAffineExpression([(w[i], a[t, i]) for i in range(N)])
+        m += d[t] - port_dev >= 0, f"abs_pos_{t}"
+        m += d[t] + port_dev >= 0, f"abs_neg_{t}"
+
+    # (4) return target and (5) cardinality
+    m += pulp.LpAffineExpression([(w[i], mu[i]) for i in range(N)]) >= inst.target, "return_target"
+    m += pulp.lpSum(z) <= inst.K, "cardinality"
+
+    # (6) linking: w_i = 0 unless z_i = 1, and then l <= w_i <= u
+    for i in range(N):
+        m += w[i] - inst.w_max * z[i] <= 0, f"link_upper_{i}"
+        m += w[i] - inst.w_min * z[i] >= 0, f"link_lower_{i}"
+
+    x = None
+    if integer_shares:
+        # whole shares: B * w_i = p_i * x_i, and at most max_cash left uninvested
+        p = inst.prices.values
+        x = [m.add_variable(f"x_{i}", lowBound=0, upBound=float(np.floor(inst.w_max * inst.budget / p[i])),
+                            cat=integer) for i in range(N)]
+        for i in range(N):
+            m += inst.budget * w[i] - p[i] * x[i] == 0, f"shares_{i}"
+        m += pulp.lpSum(w) <= 1, "budget"
+        m += pulp.lpSum(w) >= 1 - inst.max_cash, "max_cash"
+    else:
+        m += pulp.lpSum(w) == 1, "budget"     # (3) fully invested
+
+    return m, {"w": w, "z": z, "d": d, "x": x}
+
+
+model, _ = build_model(inst)
+pd.Series({
+    "binary variables z": inst.N,
+    "continuous variables w, d": inst.N + inst.T,
+    "constraints": model.numConstraints(),
+    "non-zeros in (1)-(2)": 2 * inst.N * inst.T,
+    "candidate subsets |S| <= 5": f"{sum(math.comb(inst.N, k) for k in range(1, 6)):.3e}",
+}).to_frame("full problem")
+
+
+# ## 5. Implementation: solving the model
+# **How the solver works: LP-based Branch & Bound** (Land & Doig, 1960), plus cutting planes and primal heuristics:
+# 1. Solve the **LP relaxation** ($0 \le z_i \le 1$). Its value is a **lower bound** on the best possible risk.
+# 2. If some $z_i$ is fractional, **branch**: create one sub-problem with $z_i = 0$ and one with $z_i = 1$.
+# 3. **Prune** a node if its LP is infeasible, or its bound is no better than the best integer portfolio found so far (the *incumbent*), or its LP solution is already integral.
+# 4. When every node is pruned, the incumbent is **proven optimal**.
+# 
+# At any moment the solver knows two numbers: the **incumbent** (the best portfolio found) and the **best bound** (no portfolio can be better than this). Their relative difference is the **optimality gap**:
+# $$\text{gap} = \frac{\text{incumbent} - \text{bound}}{\text{incumbent}}$$
+# If a time limit stops the search early, we still get a portfolio *and* a guarantee that it is at most *gap* % worse than the true optimum. A heuristic cannot give this guarantee.
+# 
+# **A PuLP pitfall we found.** PuLP's `status` says *"Optimal"* even when the time limit stopped the solver with only a feasible solution. The reliable field is `sol_status` (1 = proven optimal, 2 = feasible but not proven). For HiGHS we read the bound, gap and node count directly from the solver object; for CBC we parse its log.
+
+# In[7]:
+
+
+SOL_STATUS = {
+    pulp.LpSolutionOptimal: "optimal",
+    pulp.LpSolutionIntegerFeasible: "feasible (time limit)",
+    pulp.LpSolutionNoSolutionFound: "no solution found",
+    pulp.LpSolutionInfeasible: "infeasible",
+    pulp.LpSolutionUnbounded: "unbounded",
+}
+LOG_DIR = RESULTS_DIR / "logs"
+
+
+def make_solver(name, time_limit, gap_rel=1e-6, msg=False):
+    if name == "highs":
+        return pulp.HiGHS(msg=msg, timeLimit=time_limit, gapRel=gap_rel)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return pulp.PULP_CBC_CMD(msg=msg, timeLimit=time_limit, gapRel=gap_rel, logPath=str(LOG_DIR / "cbc_last.log"))
+
+
+def solve(inst, solver="highs", time_limit=300, integer_shares=False, relax=False, msg=False):
+    """Build + solve the model. Returns a dict with the portfolio and the solver's proof."""
+    t0 = time.perf_counter()
+    m, var = build_model(inst, integer_shares=integer_shares, relax=relax)
+    build_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    m.solve(make_solver(solver, time_limit, msg=msg))
+    solve_time = time.perf_counter() - t0
+
+    if relax:   # an LP: either solved to optimality or not
+        status = "optimal" if m.status == pulp.LpStatusOptimal else pulp.LpStatus[m.status]
+    else:
+        status = SOL_STATUS.get(m.sol_status, pulp.LpStatus[m.status])
+    has_solution = status in ("optimal", "feasible (time limit)")
+
+    w = np.array([max(v.value() or 0.0, 0.0) for v in var["w"]]) if has_solution else np.zeros(inst.N)
+    w[w < 1e-9] = 0.0
+    weights = pd.Series(w, index=inst.tickers)
+    objective = pulp.value(m.objective) if has_solution else None
+    shares = (pd.Series([round(v.value()) for v in var["x"]], index=inst.tickers)
+              if integer_shares and has_solution else None)
+
+    # proof: best bound, gap, explored nodes
+    bound, nodes = None, None
+    if relax:
+        bound = objective
+    elif solver == "highs":
+        info = m.solverModel.getInfo()
+        bound, nodes = info.mip_dual_bound, int(info.mip_node_count)
+    else:  # CBC: read its log
+        import re
+        log = (LOG_DIR / "cbc_last.log").read_text()
+        b, n = re.search(r"Lower bound:\s+([-\d.eE+]+)", log), re.search(r"Enumerated nodes:\s+(\d+)", log)
+        bound, nodes = (float(b.group(1)) if b else objective), (int(n.group(1)) if n else None)
+    gap = max(objective - bound, 0.0) / objective if objective and bound is not None else None
+
+    return {
+        "status": status, "proven_optimal": status == "optimal", "mad": objective,
+        "best_bound": bound, "gap": gap, "solve_time": solve_time, "build_time": build_time,
+        "nodes": nodes, "weights": weights, "portfolio": weights[weights > 0].sort_values(ascending=False),
+        "shares": shares, "solver": solver,
+        "n_variables": len(m.variables()), "n_integer": sum(v.cat == pulp.LpInteger for v in m.variables()),
+        "n_constraints": m.numConstraints(),
+    }
+
+
+# ## 6. A method-independent evaluator
+# `evaluate_weights` scores **any** portfolio (from this MILP or from the heuristic) with the same objective and the same feasibility rules. This keeps the comparison between methods fair. It is deliberately written **without** PuLP, so it is an independent check of the solver's answer.
+# 
+# > **For the heuristic notebook:** copy this function (and the parameter cell) unchanged, so both methods are scored identically.
+
+# In[8]:
+
+
+def evaluate_weights(weights, inst, tol=1e-6):
+    """weights: array aligned with inst.tickers, or {ticker: weight} dict."""
+    if isinstance(weights, dict):
+        weights = np.array([weights.get(t, 0.0) for t in inst.tickers])
+    w = np.asarray(weights, dtype=float)
+    held = w > tol
+    exp_ret = float(inst.mu @ w)
+
+    violations = []
+    if held.sum() > inst.K:
+        violations.append(f"holds {held.sum()} > {inst.K} stocks")
+    if (w[held] < inst.w_min - tol).any():
+        violations.append("weight below minimum")
+    if (w > inst.w_max + tol).any():
+        violations.append("weight above maximum")
+    if w.sum() > 1 + tol or (w < -tol).any():
+        violations.append("budget exceeded")
+    if w.sum() < 1 - inst.max_cash - tol:
+        violations.append(f"more than {inst.max_cash:.0%} left as cash")
+    if exp_ret < inst.target - tol:
+        violations.append("return target not met")
+
+    return {
+        "mad": float(np.abs(inst.deviations @ w).mean()),
+        "expected_annual_return": exp_ret * PERIODS_PER_YEAR,
+        "annual_volatility": float(np.std(inst.returns.values @ w, ddof=1) * np.sqrt(PERIODS_PER_YEAR)),
+        "n_assets": int(held.sum()),
+        "invested": float(w.sum()),
+        "feasible": not violations,
+        "violations": violations,
+    }
+
+
+# ## 7. Worked example: LP relaxation vs Branch & Bound on 10 stocks
+# We take 10 random stocks and solve:
+# * the **LP relaxation** (what B&B sees at the root node);
+# * the full **MILP**.
+
+# In[9]:
+
+
+toy = random_subinstance(inst, n=10, seed=0)
+
+lp_model, lp_vars = build_model(toy, relax=True)
+lp_model.solve(make_solver("highs", 60))
+lp = pd.DataFrame({"w": [v.value() for v in lp_vars["w"]], "z": [v.value() for v in lp_vars["z"]]},
+                  index=toy.tickers)
+mip = solve(toy)
+
+table = pd.DataFrame({"LP relaxation: w": lp["w"], "LP relaxation: z": lp["z"],
+                      "MILP: w": mip["weights"], "MILP: z": (mip["weights"] > 0).astype(int)}).round(3)
+display(table)
+lp_mad = pulp.value(lp_model.objective)
+print(f"LP relaxation MAD (lower bound): {lp_mad:.5f} - stocks with w>0: {(lp['w'] > 1e-9).sum()}")
+print(f"MILP optimum MAD               : {mip['mad']:.5f} - stocks held: {len(mip['portfolio'])} "
+      f"(B&B nodes: {mip['nodes']}, {mip['solve_time']:.2f}s)")
+print(f"gap closed by branching        : {(mip['mad'] - lp_mad) / mip['mad']:.1%}")
+
+
+# **What we see.**
+# * The LP relaxation invests in **8** stocks, more than the 5 allowed, with fractional $z_i$.
+# * Branch & Bound forces each $z_i$ to 0 or 1 and finds the best 5-stock portfolio. Its risk is higher, because the restriction costs something.
+# 
+# **Why the relaxation is weak (key insight for large problems).** Look at the column $z$: every relaxed value is exactly $z_i = w_i / u$ (e.g. 0.126 / 0.4 = 0.315). That is the cheapest way to satisfy (6). Then
+# $$\sum_i z_i = \frac{1}{u}\sum_i w_i = \frac{1}{0.4} = 2.5 \ \le\ K = 5,$$
+# so **the cardinality constraint (5) never binds at the root node**. The root bound is just the risk of the best *unrestricted* portfolio, and the solver gets no help from (5) until it branches. Section 9 shows that this makes large instances hard to *prove* optimal.
+
+# ## 8. Verification: is the "exact" answer really optimal?
+# An exact method is only useful if it really is exact. We check the implementation in four independent ways. Each check is an `assert`, so the notebook stops with an error if any check fails.
+# 
+# ### 8.1 Brute force
+# Once the set $S$ of held stocks is fixed, the problem is an ordinary LP. Solving that LP for **every** subset with $|S| \le K$ and keeping the best gives the global optimum **without Branch & Bound and without PuLP** (we use SciPy's `linprog`). This is only possible for small $N$, because the number of subsets explodes. That explosion is exactly why we need the MILP.
+
+# In[10]:
+
+
+def n_subsets(n, K=MAX_ASSETS):
+    return sum(math.comb(n, k) for k in range(1, K + 1))
+
+
+def subset_lp(inst, subset):
+    """min MAD when only the stocks in `subset` may be held (each between l and u)."""
+    T, k = inst.T, len(subset)
+    A = inst.deviations[:, subset]
+    c = np.concatenate([np.zeros(k), np.full(T, 1.0 / T)])          # variables: [w_1..w_k, d_1..d_T]
+    I = np.eye(T)
+    A_ub = np.vstack([np.hstack([A, -I]),                             #  a_t.w - d_t <= 0   (1)
+                      np.hstack([-A, -I]),                            # -a_t.w - d_t <= 0   (2)
+                      np.concatenate([-inst.mu[list(subset)], np.zeros(T)])[None, :]])   # (4)
+    b_ub = np.concatenate([np.zeros(2 * T), [-inst.target]])
+    A_eq = np.concatenate([np.ones(k), np.zeros(T)])[None, :]        # (3)
+    bounds = [(inst.w_min, inst.w_max)] * k + [(0, None)] * T
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=[1.0], bounds=bounds, method="highs")
+    return res.fun if res.status == 0 else None
+
+
+def brute_force(inst):
+    best, best_subset, n_lp, t0 = np.inf, None, 0, time.perf_counter()
+    for k in range(1, inst.K + 1):
+        if k * inst.w_max < 1 - 1e-9:          # k stocks cannot reach 100% with weights <= u
+            continue
+        for subset in itertools.combinations(range(inst.N), k):
+            n_lp += 1
+            val = subset_lp(inst, subset)
+            if val is not None and val < best - 1e-12:
+                best, best_subset = val, subset
+    return {"mad": best, "tickers": [inst.tickers[i] for i in best_subset],
+            "n_lp": n_lp, "time": time.perf_counter() - t0}
+
+
+for seed in [0, 1, 2]:
+    sub = random_subinstance(inst, n=12, seed=seed)
+    milp, bf = solve(sub), brute_force(sub)
+    assert milp["proven_optimal"]
+    assert abs(milp["mad"] - bf["mad"]) <= 1e-6 * bf["mad"]
+    assert set(milp["portfolio"].index) == set(bf["tickers"])
+    print(f"seed {seed}: MILP {milp['mad']:.8f} ({milp['solve_time']:.2f}s) == brute force {bf['mad']:.8f} "
+          f"({bf['n_lp']} LPs, {bf['time']:.1f}s)  same stocks: {sorted(bf['tickers'])}")
+
+
+# ### 8.2 Feasibility check with the independent evaluator
+# ### 8.3 LP relaxation is a lower bound
+# ### 8.4 Whole-share plan respects the budget and the cash limit
+
+# In[11]:
+
+
+sub = random_subinstance(inst, n=30, seed=3)
+res = solve(sub)
+ev = evaluate_weights(res["weights"].values, sub)
+assert ev["feasible"], ev["violations"]
+assert abs(ev["mad"] - res["mad"]) <= 1e-6 * res["mad"]          # evaluator reproduces the objective
+print(f"8.2 feasible: {ev['feasible']}, solver MAD {res['mad']:.6f} == evaluator MAD {ev['mad']:.6f}")
+
+lp_res = solve(sub, relax=True)
+assert lp_res["mad"] <= res["mad"] + 1e-9
+print(f"8.3 LP bound {lp_res['mad']:.6f} <= MILP optimum {res['mad']:.6f}")
+
+res_int = solve(sub, integer_shares=True)
+spent = float((res_int["shares"] * sub.prices).sum())
+assert res_int["proven_optimal"] and (1 - sub.max_cash) * sub.budget - 1e-6 <= spent <= sub.budget + 1e-6
+assert evaluate_weights(res_int["weights"].values, sub)["feasible"]
+print(f"8.4 whole shares: spent ${spent:,.2f} of ${sub.budget:,.0f} "
+      f"({res_int['shares'][res_int['shares'] > 0].to_dict()})")
+
+bad = pd.Series(0.0, index=inst.tickers); bad.iloc[:6] = 1 / 6
+assert not evaluate_weights(bad.values, inst)["feasible"]       # evaluator rejects 6 stocks
+print("evaluator correctly rejects an infeasible portfolio:", evaluate_weights(bad.values, inst)["violations"])
+
+
+# ### 8.5 A second, independent solver (CBC)
+# Both solvers implement Branch & Bound independently. If they agree, a solver bug is unlikely. The disagreements found in the larger comparison (section 9.3) are discussed there.
+
+# In[12]:
+
+
+sub = random_subinstance(inst, n=25, seed=7)
+h, c = solve(sub, solver="highs"), solve(sub, solver="cbc")
+assert h["proven_optimal"] and c["proven_optimal"]
+assert abs(h["mad"] - c["mad"]) <= 1e-5 * h["mad"]
+print(f"HiGHS {h['mad']:.8f} ({h['solve_time']:.2f}s)  CBC {c['mad']:.8f} ({c['solve_time']:.2f}s)")
+print("All verification checks passed.")
+
+
+# ## 9. Experiments
+# Each experiment is a list of runs. `run_experiment` executes them one by one and **appends each result row to a CSV** as soon as it finishes. If the notebook is interrupted, re-running skips the rows already saved. With `RUN_EXPERIMENTS = False` it only loads the saved CSV.
+# 
+# `result_row` turns a `solve()` result into one table row with everything we analyse: status, risk, bound, gap, time, nodes, model size and the chosen portfolio.
+
+# In[13]:
+
+
+def result_row(res, sub, **keys):
+    ev = evaluate_weights(res["weights"].values, sub) if res["mad"] is not None else {}
+    return {**keys, "n_assets": sub.N, "solver": res["solver"], "status": res["status"],
+            "proven_optimal": res["proven_optimal"], "mad": res["mad"], "best_bound": res["best_bound"],
+            "gap": res["gap"], "solve_time": round(res["solve_time"], 3), "build_time": round(res["build_time"], 3),
+            "nodes": res["nodes"], "n_variables": res["n_variables"], "n_integer": res["n_integer"],
+            "n_constraints": res["n_constraints"],
+            "target_annual_return": sub.target * PERIODS_PER_YEAR,
+            "expected_annual_return": ev.get("expected_annual_return"),
+            "annual_volatility": ev.get("annual_volatility"), "n_held": ev.get("n_assets"),
+            "feasible": ev.get("feasible"), "portfolio": json.dumps(res["portfolio"].round(4).to_dict())}
+
+
+def run_experiment(name, runs, run_one):
+    """runs: list of dicts identifying each run; run_one(**run) -> result row (dict)."""
+    path = RESULTS_DIR / f"{name}.csv"
+    if RUN_EXPERIMENTS:
+        done = pd.read_csv(path) if path.exists() else pd.DataFrame()
+        for run in runs:
+            if not done.empty and (done[list(run)].astype(str) == pd.Series(run).astype(str)).all(axis=1).any():
+                continue                                    # already computed
+            row = run_one(**run)
+            pd.DataFrame([row]).to_csv(path, mode="a", header=not path.exists(), index=False)
+            done = pd.read_csv(path)
+            print({k: row[k] for k in list(run) + ["status", "mad", "gap", "solve_time"] if k in row})
+    return pd.read_csv(path)
+
+
+# ### 9.1 Exactness at scale: MILP vs brute force (N = 8 … 20)
+# Section 8.1 checked three instances. Here we repeat the check on **18** instances and record how long each method takes.
+
+# In[14]:
+
+
+def run_validation(n, seed):
+    sub = random_subinstance(inst, n, seed)
+    milp, bf = solve(sub), brute_force(sub)
+    return {"n": n, "seed": seed, "milp_mad": milp["mad"], "brute_force_mad": bf["mad"],
+            "abs_diff": abs(milp["mad"] - bf["mad"]), "same_portfolio": set(milp["portfolio"].index) == set(bf["tickers"]),
+            "milp_time": round(milp["solve_time"], 3), "milp_nodes": milp["nodes"],
+            "brute_force_time": round(bf["time"], 3), "brute_force_lps": bf["n_lp"], "subsets_total": n_subsets(n)}
+
+val = run_experiment("validation", [{"n": n, "seed": s} for n in [8, 10, 12, 15, 18, 20] for s in [0, 1, 2]],
+                     run_validation)
+val.groupby("n").agg(instances=("seed", "count"), subsets=("subsets_total", "first"),
+                     max_abs_difference=("abs_diff", "max"), same_portfolio=("same_portfolio", "all"),
+                     milp_time_s=("milp_time", "mean"), brute_force_time_s=("brute_force_time", "mean"))
+
+
+# In[15]:
+
+
+fig, ax = plt.subplots(figsize=(7, 4))
+g = val.groupby("n")[["milp_time", "brute_force_time"]].mean()
+ax.plot(g.index, g["brute_force_time"], "o-", color=ORANGE, label="brute-force enumeration")
+ax.plot(g.index, g["milp_time"], "o-", color=BLUE, label="MILP (Branch & Bound, HiGHS)")
+ax.set_yscale("log")
+ax.set_xlabel("number of candidate stocks N")
+ax.set_ylabel("solve time (s, log scale)")
+ax.set_title("Same optimum, very different effort")
+ax.legend(loc="upper left")
+save(fig, "02_validation_runtime")
+
+
+# **Result.** On all 18 instances the MILP finds the **same optimum and the same stocks** as brute force (differences ≤ 4 × 10⁻¹⁰, i.e. floating-point rounding). Brute-force time grows with the number of subsets (21,699 LPs and about 2 minutes at N = 20); Branch & Bound needs about 2 seconds, because it prunes most subsets without ever solving them.
+
+# ### 9.2 The full problem: 457 stocks
+# We solve the real problem with a 30-minute limit, in both variants (continuous weights, and whole shares with ≤ 1% cash). We also record the LP relaxation (root) bound.
+
+# In[16]:
+
+
+def run_main(variant):
+    integer_shares = variant == "integer_shares"
+    lp = solve(inst, relax=True, integer_shares=integer_shares)
+    res = solve(inst, time_limit=MAIN_TIME_LIMIT, integer_shares=integer_shares)
+    held = res["portfolio"]
+    alloc = pd.DataFrame({"weight": held, "dollars": held * inst.budget, "price": inst.prices[held.index]})
+    if integer_shares:
+        alloc["shares"] = res["shares"][held.index]
+        alloc["dollars"] = alloc["shares"] * alloc["price"]
+    alloc.index.name = "ticker"
+    alloc.to_csv(RESULTS_DIR / f"main_allocation_{variant}.csv")
+    return result_row(res, inst, variant=variant) | {"lp_relaxation_bound": lp["mad"]}
+
+main = run_experiment("main_summary", [{"variant": "continuous"}, {"variant": "integer_shares"}], run_main)
+main = main.set_index("variant")
+main[["status", "mad", "best_bound", "gap", "lp_relaxation_bound", "solve_time", "nodes",
+      "n_variables", "n_constraints", "expected_annual_return", "annual_volatility", "n_held"]].T
+
+
+# In[17]:
+
+
+alloc_c = pd.read_csv(RESULTS_DIR / "main_allocation_continuous.csv", index_col="ticker")
+alloc_i = pd.read_csv(RESULTS_DIR / "main_allocation_integer_shares.csv", index_col="ticker")
+
+print("Continuous weights")
+display(alloc_c.style.format({"weight": "{:.1%}", "dollars": "${:,.2f}", "price": "${:,.2f}"}))
+
+print(f"Whole-share purchase plan on 2016-12-30 (budget ${BUDGET:,.0f})")
+plan = alloc_i.copy()
+plan.loc["cash (unspent)"] = [1 - plan["weight"].sum(), BUDGET - plan["dollars"].sum(), np.nan, np.nan]
+display(plan.style.format({"weight": "{:.2%}", "dollars": "${:,.2f}", "price": "${:,.2f}", "shares": "{:.0f}"},
+                          na_rep=""))
+
+# independent re-check with the evaluator
+for name, alloc in [("continuous", alloc_c), ("integer_shares", alloc_i)]:
+    ev = evaluate_weights(alloc["weight"].to_dict(), inst)
+    assert ev["feasible"], ev["violations"]
+    print(f"{name:15s} feasible={ev['feasible']}  MAD={ev['mad']:.5f}  E[return]={ev['expected_annual_return']:.1%}/yr  "
+          f"volatility={ev['annual_volatility']:.1%}/yr  stocks={ev['n_assets']}")
+
+
+# **Result.**
+# * Both variants select **the same five stocks**: CLX (Clorox, consumer staples), RE (Everest Re, reinsurance), AZO (AutoZone, retail), FB (Facebook, technology) and HUM (Humana, health insurance). These five companies come from unrelated sectors, so their weekly deviations partly cancel.
+# * The 30-minute limit was reached. HiGHS found this portfolio early (within about 41 s in an exploratory run). The rest of the time raised the **lower bound** (root 0.00863 → 0.00921) without finding anything better. The remaining **certified gap of 8.6%** means *no* 5-stock portfolio can have more than 8.6% lower risk than this one.
+# * The whole-share plan spends **$9,910.98** and leaves $89.02 as cash. Its risk is marginally *lower* than the continuous one, because up to 1% may be held as risk-free cash. The two models have slightly different feasible sets, so this does not contradict optimality.
+# * **Modelling lesson:** the first version of the whole-share model had no cash limit. It returned a portfolio that kept **52% in cash**: cash has zero risk, so the model "parked" half the money and bought volatile high-return stocks to reach the target on paper. The 1% cap (`max_cash`) fixed this. An optimiser does exactly what the model says, not what we meant.
+
+# ### 9.3 Scalability: how does Branch & Bound cope as N grows?
+# For each size $N$ we draw 3 random stock subsets (seeds 0–2), solve with a 300 s limit, and record time, nodes, final gap, and the **root gap** (how far the LP relaxation is from the best portfolio).
+
+# In[18]:
+
+
+def run_scalability(n, seed):
+    sub = random_subinstance(inst, n, seed) if n < inst.N else inst
+    lp = solve(sub, relax=True)
+    res = solve(sub, time_limit=TIME_LIMIT)
+    return result_row(res, sub, n=n, seed=seed, time_limit=TIME_LIMIT) | {
+        "lp_relaxation_bound": lp["mad"], "lp_time": round(lp["solve_time"], 3),
+        "search_space_log10": math.log10(n_subsets(n))}
+
+sizes = [10, 20, 30, 40, 50, 75, 100, 150, 200, 300, 457]
+sc = run_experiment("scalability", [{"n": n, "seed": s} for n in sizes for s in ([0, 1, 2] if n < 457 else [0])],
+                    run_scalability)
+sc["root_gap"] = (sc["mad"] - sc["lp_relaxation_bound"]) / sc["mad"]
+agg = sc.groupby("n").agg(runs=("seed", "count"), proven_optimal=("proven_optimal", "mean"),
+                          mean_time_s=("solve_time", "mean"), max_time_s=("solve_time", "max"),
+                          mean_nodes=("nodes", "mean"), mean_final_gap=("gap", "mean"),
+                          mean_root_gap=("root_gap", "mean"), search_space_log10=("search_space_log10", "first"))
+agg
+
+
+# In[19]:
+
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+ax = axes[0]
+opt, lim = sc[sc["proven_optimal"]], sc[~sc["proven_optimal"]]
+ax.scatter(opt["n"], opt["solve_time"], color=BLUE, s=30, label="proven optimal", zorder=3)
+ax.scatter(lim["n"], lim["solve_time"], color=ORANGE, marker="s", s=30, label="stopped at time limit", zorder=3)
+ax.plot(agg.index, agg["mean_time_s"], color=BLUE, lw=1.5, alpha=0.6)
+ax.axhline(TIME_LIMIT, color=MUTED, lw=0.8, ls="--")
+ax.text(10, TIME_LIMIT * 1.15, f"time limit {TIME_LIMIT}s", color=MUTED, fontsize=9)
+ax.set_yscale("log")
+ax.set_xlabel("number of candidate stocks N")
+ax.set_ylabel("solve time (s, log scale)")
+ax.set_title("Runtime explodes with N")
+ax.legend(loc="lower right")
+
+ax = axes[1]
+ax.plot(agg.index, agg["mean_root_gap"], "o-", color=ORANGE, label="root gap (LP relaxation)")
+ax.plot(agg.index, agg["mean_final_gap"], "o-", color=BLUE, label="final gap after B&B")
+ax.yaxis.set_major_formatter(PercentFormatter(1))
+ax.set_xlabel("number of candidate stocks N")
+ax.set_ylabel("optimality gap")
+ax.set_title("Certified optimality gap")
+ax.legend(loc="upper left")
+fig.tight_layout()
+save(fig, "02_scalability")
+
+
+# **Result.**
+# * **Up to N = 100** every instance is proven optimal (mean 74 s at N = 100). **From N = 150** no instance can be proven within 300 s. This is the practical face of NP-hardness: the number of subsets grows like $\binom{N}{5} \sim N^5$, and the B&B tree grows with it (from 4 nodes at N = 10 to ~10,000 at N = 150).
+# * The **root gap grows from 0.8% to 14.3%**, because the relaxation ignores the cardinality constraint (section 7). The larger the universe, the more the unrestricted portfolio can spread out, and the more work branching has to do.
+# * Even when stopped, the method returns a **certified** bound: on the full problem the answer is at most 12.6% (after 300 s) or 8.6% (after 30 min) from optimal.
+
+# ### 9.4 Two independent solvers: HiGHS vs CBC
+
+# In[20]:
+
+
+def run_solver(n, seed, solver):
+    sub = random_subinstance(inst, n, seed)
+    return result_row(solve(sub, solver=solver, time_limit=TIME_LIMIT), sub, n=n, seed=seed, time_limit=TIME_LIMIT)
+
+sv = run_experiment("solver_comparison",
+                    [{"n": n, "seed": s, "solver": slv} for n in [10, 20, 30, 40, 50] for s in [0, 1, 2]
+                     for slv in ["highs", "cbc"]], run_solver)
+g = sv.groupby(["n", "solver"])["solve_time"].mean().unstack()
+g["CBC / HiGHS"] = g["cbc"] / g["highs"]
+g
+
+
+# In[21]:
+
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(g.index, g["cbc"], "o-", color=ORANGE, label="CBC")
+ax.plot(g.index, g["highs"], "o-", color=BLUE, label="HiGHS")
+ax.set_yscale("log")
+ax.set_xlabel("number of candidate stocks N")
+ax.set_ylabel("mean solve time (s, log scale)")
+ax.set_title("HiGHS is 1.2–2.9x faster than CBC")
+ax.legend(loc="upper left")
+save(fig, "02_solver_comparison")
+
+both = sv.pivot_table(index=["n", "seed"], columns="solver", values="mad")
+both["relative_difference"] = (both["cbc"] - both["highs"]) / both["highs"]
+print("all runs proven optimal by both solvers:", sv["proven_optimal"].all())
+both[both["relative_difference"].abs() > 1e-7]
+
+
+# **Finding: CBC's "optimal" is not always optimal.** Both solvers report *optimal* on all 15 instances and agree on 13. On 2 instances CBC returns a slightly worse portfolio (by 0.01% and 0.08%) while still claiming optimality. The next cell checks which solver is right, using tools that do not depend on either solver.
+
+# In[22]:
+
+
+for n, seed in [(20, 0), (50, 1)]:
+    sub = random_subinstance(inst, n, seed)
+    for solver in ["highs", "cbc"]:
+        r = solve(sub, solver=solver)
+        idx = tuple(sub.tickers.index(t) for t in r["portfolio"].index)
+        print(f"N={n} seed={seed} {solver:5s} claims {r['status']}: MAD {r['mad']:.7f} | "
+              f"evaluator {evaluate_weights(r['weights'].values, sub)['mad']:.7f} | "
+              f"fixed-subset LP {subset_lp(sub, idx):.7f} | {sorted(r['portfolio'].index)}")
+
+
+# * The HiGHS portfolios satisfy every constraint, and their risk is reproduced by the evaluator and by the fixed-subset LP. At N = 20 the HiGHS answer also matches brute force (section 9.1). So in the saved experiment **CBC pruned the true optimum** on both instances.
+# * On re-running, CBC **still misses the optimum at N = 20**, but at N = 50 it may now return the correct portfolio. CBC's answer on these instances depends on its settings: in our tests, the time-limit setting and switching presolve or cut generation on or off all changed whether the error appeared. This points to **floating-point tolerances** in CBC's search rather than an error in the model, which is identical for both solvers.
+# 
+# *Lesson:* an "exact" solver is only as exact as its numerical tolerances. Independent verification (brute force, a second solver, a separate evaluator) is part of using exact methods responsibly. HiGHS, which agreed with brute force everywhere, is our primary solver.
+
+# ### 9.5 Efficient frontier: what does the 5-stock rule cost?
+# We vary the return target from 10% to 45% and solve:
+# * the **K = 5 MILP**;
+# * the **unconstrained** model (any number of stocks, no minimum weight). Here the binaries are redundant and the model is an ordinary LP.
+
+# In[23]:
+
+
+unconstrained = replace(inst, K=inst.N, w_min=0.0)
+
+def run_frontier(model, target):
+    base = inst if model == "K=5 (MILP)" else unconstrained
+    sub = replace(base, target=target / PERIODS_PER_YEAR)
+    res = solve(sub, relax=model != "K=5 (MILP)", time_limit=TIME_LIMIT)
+    return result_row(res, sub, model=model, target=target)
+
+targets = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+fr = run_experiment("frontier", [{"model": m, "target": t} for m in ["K=5 (MILP)", "unconstrained (LP)"]
+                                 for t in targets], run_frontier)
+fr[["model", "target", "status", "mad", "gap", "n_held", "solve_time"]]
+
+
+# In[24]:
+
+
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+for (name, grp), color, marker in zip(fr.groupby("model", sort=False), [BLUE, ORANGE], ["o", "s"]):
+    ax.plot(grp["mad"], grp["target"], marker=marker, color=color, label=name)
+ax.yaxis.set_major_formatter(PercentFormatter(1))
+ax.set_xlabel("risk: weekly mean absolute deviation")
+ax.set_ylabel("required expected annual return")
+ax.set_title("Efficient frontiers with and without the 5-stock limit")
+ax.legend(loc="lower right")
+save(fig, "02_frontier")
+
+wide = fr.pivot_table(index="target", columns="model", values="mad")
+k5_bound = fr[fr["model"] == "K=5 (MILP)"].set_index("target")["best_bound"]
+wide["extra risk (lower estimate)"] = k5_bound / wide["unconstrained (LP)"] - 1
+wide["extra risk (upper estimate)"] = wide["K=5 (MILP)"] / wide["unconstrained (LP)"] - 1
+wide.style.format({"K=5 (MILP)": "{:.5f}", "unconstrained (LP)": "{:.5f}",
+                   "extra risk (lower estimate)": "{:.1%}", "extra risk (upper estimate)": "{:.1%}"})
+
+
+# **Result.**
+# * The unconstrained frontier (an LP, under 0.5 s per point) is the best risk achievable with **any** number of stocks; those portfolios hold 11–39 stocks. The gap between the curves is the **price of simplicity**: 4%–20% extra risk for an investor limited to five companies (about 17% at the 20% target). Most K = 5 points stopped at the time limit, so the true value lies between the lower and upper estimates.
+# * At the 20% target the unconstrained LP risk (0.00863) **equals the root bound of the 5-stock MILP** (section 9.2). This confirms numerically that the LP relaxation ignores the cardinality constraint.
+# * **Higher targets are easier to solve:** 40% and 45% are proven optimal in 103 s and 32 s. Only a few stocks have a high enough mean return, so the return constraint (4) prunes most of the tree.
+
+# ### 9.6 Sensitivity to K (maximum number of stocks)
+
+# In[25]:
+
+
+def run_cardinality(K):
+    sub = replace(inst, K=K)
+    return result_row(solve(sub, time_limit=TIME_LIMIT), sub, K=K)
+
+ca = run_experiment("cardinality", [{"K": K} for K in [3, 4, 5, 6, 8, 10, 15]], run_cardinality)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(ca["K"], ca["mad"], "o-", color=BLUE, label="best portfolio found")
+ax.fill_between(ca["K"], ca["best_bound"], ca["mad"], color=BLUE, alpha=0.12, label="certified optimality gap")
+ax.set_xlabel("maximum number of stocks K")
+ax.set_ylabel("risk: weekly MAD")
+ax.set_title("Diminishing benefit of holding more stocks")
+ax.legend(loc="upper right")
+save(fig, "02_cardinality")
+ca[["K", "status", "mad", "best_bound", "gap", "n_held", "solve_time"]]
+
+
+# **Result.** Risk falls quickly from K = 3 to K = 6 and then flattens: going from 5 to 15 stocks reduces MAD by only about 11%. Allowing 5 stocks therefore captures most of the diversification benefit available within this limit. The shaded band is the certified gap: none of these runs was proven optimal within 300 s, but the true optimum must lie inside the band.
+
+# ## 10. Out-of-sample validation (2017-01 → 2018-02)
+# The model only saw data up to 2016-12-30. We now buy the portfolio at that day's close and **hold it for 13 months without rebalancing**. As a benchmark we use an equally weighted portfolio of all 457 stocks (a proxy for the S&P 500).
+
+# In[26]:
+
+
+def buy_and_hold(prices, weights, budget=BUDGET):
+    """Daily value of the portfolio; uninvested weight is held as cash."""
+    weights = weights[weights > 0]
+    shares = budget * weights / prices[weights.index].iloc[0]
+    return (prices[weights.index] * shares).sum(axis=1) + budget * (1 - weights.sum())
+
+
+def performance(values):
+    r = values.pct_change().dropna()
+    total = values.iloc[-1] / values.iloc[0] - 1
+    ann_ret = (1 + total) ** (252 / len(r)) - 1
+    vol = r.std() * np.sqrt(252)
+    return {"final_value": values.iloc[-1], "total_return": total, "annual_return": ann_ret,
+            "annual_volatility": vol, "sharpe_ratio": ann_ret / vol,
+            "max_drawdown": (values / values.cummax() - 1).min()}
+
+
+hold = daily_prices.loc["2016-12-30":]
+curves = {
+    "MILP portfolio (continuous)": buy_and_hold(hold, alloc_c["weight"]),
+    "MILP portfolio (whole shares)": buy_and_hold(hold, alloc_i["weight"]),
+    "equal-weight 457 stocks": buy_and_hold(hold, pd.Series(1 / hold.shape[1], index=hold.columns)),
+}
+perf = pd.DataFrame({k: performance(v) for k, v in curves.items()}).T
+perf.style.format({"final_value": "${:,.0f}", "total_return": "{:.1%}", "annual_return": "{:.1%}",
+                   "annual_volatility": "{:.1%}", "sharpe_ratio": "{:.2f}", "max_drawdown": "{:.1%}"})
+
+
+# In[27]:
+
+
+fig, ax = plt.subplots(figsize=(8, 4.2))
+for (name, v), color in zip(curves.items(), [BLUE, GREEN, ORANGE]):
+    ax.plot(v.index, v.values, color=color, lw=2 if "equal" not in name else 1.6, label=f"{name}: ${v.iloc[-1]:,.0f}")
+ax.axhline(BUDGET, color=MUTED, lw=0.8)
+ax.set_ylabel("portfolio value ($)")
+ax.yaxis.set_major_formatter(plt.matplotlib.ticker.StrMethodFormatter("${x:,.0f}"))
+ax.set_title("Out-of-sample: $10,000 invested on 2016-12-30, held to 2018-02-07")
+ax.legend(loc="upper left")
+save(fig, "02_out_of_sample")
+
+held = alloc_c["weight"]
+stock_ret = hold[held.index].iloc[-1] / hold[held.index].iloc[0] - 1
+pd.DataFrame({"weight": held, "stock return": stock_ret, "contribution": held * stock_ret}).style.format("{:.1%}")
+
+
+# **Interpreting the result (honestly).**
+# * The optimal portfolio made money (+14.3%, about $1,430 on $10,000), with a slightly **smaller maximum drawdown** than the benchmark. However, it did **not** reach its 20% expected return, and it lagged the equal-weight portfolio of all 457 stocks (+17.8%).
+# * This is not a failure of the optimiser, which solved the model it was given. The cause is **estimation error**: mean returns estimated from 4 years of data are very noisy, and individual stocks did not repeat their historical averages (AZO fell 8% while FB rose 57%).
+# * Five stocks cannot diversify like 457. The portfolio's realised volatility (10.5%) is higher than the benchmark's (8.4%). This is the real-world **price of the cardinality constraint**, matching the in-sample frontier in section 9.5.
+# * So the exact method guarantees the best answer *to the model*; the quality of the *decision* also depends on the inputs.
+
+# ## 11. Export for the comparison with the heuristic
+# The solution is saved in a method-neutral JSON file (`results/exact/exact_solution.json`). The heuristic notebook can load it and compare its own portfolio using the same `evaluate_weights`. For the scalability comparison, `results/exact/scalability.csv` contains the exact optimum, or the certified lower bound, for the same `n`/`seed` subsets (`random_subinstance`), so the heuristic's true gap can be measured.
+
+# In[28]:
+
+
+out = {}
+for variant, alloc, label in [("continuous", alloc_c, "MILP portfolio (continuous)"),
+                              ("integer_shares", alloc_i, "MILP portfolio (whole shares)")]:
+    row = main.loc[variant]
+    out[variant] = {
+        "method": "exact: CC-MAD MILP (PuLP + HiGHS Branch & Bound)",
+        "status": row["status"], "mad": row["mad"], "best_bound": row["best_bound"], "gap": row["gap"],
+        "solve_time_s": row["solve_time"],
+        "weights": alloc["weight"].round(6).to_dict(),
+        "shares": alloc["shares"].astype(int).to_dict() if "shares" in alloc else None,
+        "out_of_sample": {k: round(float(v), 6) for k, v in perf.loc[label].items()},
+    }
+(RESULTS_DIR / "exact_solution.json").write_text(json.dumps(out, indent=2))
+print(json.dumps(out["integer_shares"], indent=2))
+
+
+# ## 12. Discussion and future work
+# 
+# | Criterion | Exact method (CC-MAD MILP) |
+# |---|---|
+# | **Solution quality** | Proven optimal up to N = 100; on the full problem a feasible portfolio with a **certified gap of 8.6%** after 30 min |
+# | **Runtime** | 0.3 s (N = 10) → 74 s (N = 100) → over 300 s from N = 150 |
+# | **Scalability** | Grows roughly exponentially; bottleneck is the weak LP relaxation, not the LP size (1,323 constraints) |
+# | **Feasibility** | Every returned portfolio satisfies all constraints by construction (checked independently) |
+# | **Correctness** | HiGHS matches brute force on 18/18 instances; CBC reported false optimality on 2/15 |
+# 
+# **Key insights**
+# 1. **Exactness has a price that grows with N.** Proofs take seconds up to N ≈ 100 and are out of reach within minutes beyond N ≈ 150. Even then the method gives a usable portfolio *and a guarantee*. That guarantee is also what lets us measure how good the heuristic really is.
+# 2. **The bottleneck is the weak relaxation.** At the root node $\sum z_i = 2.5 < K$, so the cardinality constraint is invisible to the LP bound, and all the work falls on branching. The good portfolio is found early; the time is spent **proving** it.
+# 3. **Verify exact solvers.** A widely used open-source solver (CBC) reported false optimality. Brute force, a second solver and an independent evaluator caught it.
+# 4. **Optimal ≠ best decision.** Out of sample, the portfolio earned +14.3% instead of the estimated 20% because of estimation error in $\mu_i$, and it diversified less than the 457-stock benchmark.
+# 
+# **Future work**
+# * **Stronger formulations** (valid inequalities linking $\sum_i z_i$ to the weight bounds) to tighten the root bound.
+# * **Hybrid method:** warm-start the MILP with the heuristic's best portfolio (fast good incumbent + exact proof).
+# * Pre-selection or dominance rules to shrink $N$; parallel B&B or a commercial solver.
+# * **Better inputs:** shrinkage or robust estimates of $\mu$, rolling re-optimisation with transaction costs, and CVaR as an alternative linear risk measure.
+# 
+# **References**
+# * Konno, H. & Yamazaki, H. (1991). Mean-absolute deviation portfolio optimization model and its applications to Tokyo stock market. *Management Science*, 37(5), 519–531.
+# * Bienstock, D. (1996). Computational study of a family of mixed-integer quadratic programming problems. *Mathematical Programming*, 74, 121–140.
+# * Moral-Escudero, R., Ruiz-Torrubiano, R. & Suárez, A. (2006). Selection of optimal investment portfolios with cardinality constraints. *IEEE Congress on Evolutionary Computation*, 2382–2388.
+# * Land, A. H. & Doig, A. G. (1960). An automatic method of solving discrete programming problems. *Econometrica*, 28(3), 497–520.
+# * Huangfu, Q. & Hall, J. A. J. (2018). Parallelizing the dual revised simplex method. *Mathematical Programming Computation*, 10, 119–142.
