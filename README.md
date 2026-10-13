@@ -1,13 +1,13 @@
 # IT5082 Optimization Methods – Cardinality-Constrained Portfolio Optimisation
 
-**Option C – The Smart Investor.** Invest **$10,000** in **at most 5** of the S&P 500 companies so that the portfolio reaches a **20% expected annual return with minimum risk**.
+**The Smart Investor.** Invest **$10,000** in **at most 5** of the S&P 500 companies so that the portfolio reaches a **20% expected annual return with minimum risk**.
 
 The problem is solved with two approaches and compared:
 
-| Branch | Method | Status |
-|---|---|---|
-| `exact-method` | **Exact:** cardinality-constrained Mean-Absolute-Deviation model as a Mixed-Integer Linear Program (PuLP + HiGHS/CBC Branch & Bound) | this branch |
-| *(heuristic branch)* | Metaheuristic | partner |
+| Branch | Method | Status              |
+|---|---|---------------------|
+| `exact-method` | **Exact:** cardinality-constrained Mean-Absolute-Deviation model as a Mixed-Integer Linear Program (PuLP + HiGHS/CBC Branch & Bound) | exact-method branch |
+| *(heuristic branch)* | Metaheuristic | partner             |
 
 ## Dataset
 [S&P 500 stock data](https://www.kaggle.com/datasets/camnugent/sandp500) (Kaggle `camnugent/sandp500`, CC0). Daily prices of 505 companies, 2013-02-08 → 2018-02-07. The raw file is committed in `data/raw/`; if it is missing, notebook 01 downloads it through `kagglehub` (no API token needed).
