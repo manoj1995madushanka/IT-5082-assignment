@@ -1,0 +1,7 @@
+,"Exact (CC-MAD MILP, HiGHS B&B)",Heuristic (SA + LP)
+"Quality, N ≤ 100",proven optimal on all 21 instances,"hit the proven optimum in 97% of runs; mean gap 0.03%, max 1.05%"
+"Quality, N = 457","MAD 0.010071, certified gap 8.6% after 30 min","best MAD 0.010071 (8/10 runs found the MILP portfolio), mean gap 0.15%"
+"Runtime, N = 457","1,800 s (time limit; incumbent after ~41 s)",57 s per run
+Scalability,proven optimal up to N = 100; time limit reached from N = 150,runtime grows roughly linearly in N (1–78 s per run)
+Feasibility,all constraints satisfied by construction (checked with evaluator),100% of scalability runs and 100% of full runs feasible (evaluator)
+Guarantee,yes: lower bound and gap,none on its own; quality measured only through the MILP bound

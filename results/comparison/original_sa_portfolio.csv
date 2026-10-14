@@ -1,0 +1,4 @@
+,mad,risk_vs_milp,expected_annual_return,annual_volatility,feasible,weights
+"MILP portfolio (CLX, RE, AZO, FB, HUM)",0.010071259388303958,1.796762738592861e-11,0.20000000000250331,0.09881734008753677,True,"{""AZO"": 0.2257, ""CLX"": 0.2771, ""FB"": 0.1325, ""HUM"": 0.1035, ""RE"": 0.2612}"
+"original SA stocks, LP-optimal weights",0.014581428520054562,0.4478257344111689,0.28067793305632005,0.12943725107268444,True,"{""HII"": 0.05, ""LMT"": 0.4, ""MO"": 0.4, ""NVDA"": 0.05, ""STZ"": 0.1}"
+"original SA portfolio, equal weights",0.01703034242504803,0.6909843912005533,0.382125786744733,0.15979724990911354,True,"{""HII"": 0.2, ""LMT"": 0.2, ""MO"": 0.2, ""NVDA"": 0.2, ""STZ"": 0.2}"
